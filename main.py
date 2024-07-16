@@ -24,17 +24,17 @@ def run(args: DictConfig):
 
     # ------------------
     #    Dataloader
+    print("Loading data...")
     # ------------------
     loader_args = {"batch_size": args.batch_size, "num_workers": args.num_workers}
     
     train_set = ThingsMEGDataset("train", args.data_dir)
-    train_loader = torch.utils.data.DataLoader(train_set, shuffle=True, **loader_args)
     val_set = ThingsMEGDataset("val", args.data_dir)
-    val_loader = torch.utils.data.DataLoader(val_set, shuffle=False, **loader_args)
     test_set = ThingsMEGDataset("test", args.data_dir)
-    test_loader = torch.utils.data.DataLoader(
-        test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers
-    )
+    
+    train_loader = torch.utils.data.DataLoader(train_set, shuffle=True, **loader_args)
+    val_loader = torch.utils.data.DataLoader(val_set, shuffle=False, **loader_args)
+    test_loader = torch.utils.data.DataLoader(test_set, shuffle=False, batch_size=args.batch_size, num_workers=args.num_workers)
 
     # ------------------
     #       Model
@@ -46,17 +46,24 @@ def run(args: DictConfig):
     # ------------------
     #     Optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    warmup_length = 20
+    scheduler = CosineScheduler(args.epochs, args.lr, warmup_length)
 
     # ------------------
     #   Start training
+    print("Start training...")
     # ------------------  
-    max_val_acc = 0
     accuracy = Accuracy(
         task="multiclass", num_classes=train_set.num_classes, top_k=10
     ).to(args.device)
-      
+    
+    max_val_acc = 0
+    
     for epoch in range(args.epochs):
+        # スケジューラで学習率を更新する
+        new_lr = scheduler(epoch)
+        set_lr(new_lr, optimizer)
         print(f"Epoch {epoch+1}/{args.epochs}")
         
         train_loss, train_acc, val_loss, val_acc = [], [], [], []
@@ -96,7 +103,6 @@ def run(args: DictConfig):
             cprint("New best.", "cyan")
             torch.save(model.state_dict(), os.path.join(logdir, "model_best.pt"))
             max_val_acc = np.mean(val_acc)
-            
     
     # ----------------------------------
     #  Start evaluation with best model
@@ -105,12 +111,49 @@ def run(args: DictConfig):
 
     preds = [] 
     model.eval()
-    for X, subject_idxs in tqdm(test_loader, desc="Validation"):        
+    for X, subject_idxs in tqdm(test_loader, desc="Test"):        
         preds.append(model(X.to(args.device)).detach().cpu())
         
     preds = torch.cat(preds, dim=0).numpy()
     np.save(os.path.join(logdir, "submission"), preds)
     cprint(f"Submission {preds.shape} saved at {logdir}", "cyan")
+
+
+class CosineScheduler:
+    def __init__(self, epochs, lr, warmup_length=5):
+        """
+        Arguments
+        ---------
+        epochs : int
+            学習のエポック数．
+        lr : float
+            学習率．
+        warmup_length : int
+            warmupを適用するエポック数．
+        """
+        self.epochs = epochs
+        self.lr = lr
+        self.warmup = warmup_length
+
+    def __call__(self, epoch):
+        """
+        Arguments
+        ---------
+        epoch : int
+            現在のエポック数．
+        """
+        progress = (epoch - self.warmup) / (self.epochs - self.warmup)
+        progress = np.clip(progress, 0.0, 1.0)
+        lr = self.lr * 0.5 * (1. + np.cos(np.pi * progress))
+
+        if self.warmup:
+            lr = lr * min(1., (epoch+1) / self.warmup)
+
+        return lr
+
+def set_lr(lr, optimizer):
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
 
 
 if __name__ == "__main__":
